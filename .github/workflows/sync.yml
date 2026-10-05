@@ -1,0 +1,102 @@
+name: Sync Red Hat CSAF VEX Data
+
+on:
+  schedule:
+    # Runs every 2 hours
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    # Allows for manual triggering from the GitHub Actions UI
+
+permissions:
+  contents: write
+
+jobs:
+  sync-vex-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync Data
+        run: |
+          BASE_URL="https://security.access.redhat.com/data/csaf/v2/vex-feed"
+          
+          # Check if we have year directories (e.g., 2024, 2025). 
+          # If not, we assume this is the first run.
+          FIRST_RUN=true
+          if ls -d 20*/ >/dev/null 2>&1; then
+            FIRST_RUN=false
+          fi
+
+          if [ "$FIRST_RUN" = true ]; then
+            echo "Initial run detected. Downloading full archive..."
+            
+            # 1. Fetch the latest archive name
+            LATEST_ARCHIVE=$(curl -s "$BASE_URL/archive_latest.txt" | tr -d '\r')
+            echo "Latest archive: $LATEST_ARCHIVE"
+            
+            # 2. Download and Extract
+            curl -O "$BASE_URL/$LATEST_ARCHIVE"
+            tar --zstd -xf "$LATEST_ARCHIVE"
+            rm "$LATEST_ARCHIVE"
+            
+            # 3. Use index.txt to catch anything missed by the archive
+            curl -O "$BASE_URL/index.txt"
+            while IFS= read -r raw_filepath; do
+              filepath=$(echo "$raw_filepath" | tr -d '\r')
+              if [[ -n "$filepath" && ! -f "$filepath" ]]; then
+                mkdir -p "$(dirname "$filepath")"
+                curl -s -f -o "$filepath" "$BASE_URL/$filepath"
+              fi
+            done < index.txt
+          
+          else
+            echo "Subsequent run detected. Syncing changes from the last 3 hours..."
+            
+            # 1. Download changes.csv
+            curl -s -o changes.csv "$BASE_URL/changes.csv"
+            
+            # 2. Calculate the threshold (3 hours ago in seconds)
+            THRESHOLD=$(date -d '3 hours ago' +%s)
+            echo "Checking for changes after: $(date -d @$THRESHOLD)"
+
+            # 3. Process the CSV
+            # Format: "path/to/file.json","2026-05-06T16:00:33+00:00"
+            while IFS=',' read -r raw_file raw_date; do
+              # Strip quotes and carriage returns
+              file=$(echo "$raw_file" | tr -d '"\r')
+              date_str=$(echo "$raw_date" | tr -d '"\r')
+              
+              # Skip empty lines
+              [[ -z "$file" ]] && continue
+
+              # Convert file date to seconds
+              FILE_TIME=$(date -d "$date_str" +%s 2>/dev/null)
+              
+              if [ "$FILE_TIME" -gt "$THRESHOLD" ]; then
+                echo "Downloading updated file: $file ($date_str)"
+                mkdir -p "$(dirname "$file")"
+                curl -s -f -o "$file" "$BASE_URL/$file" || echo "Warning: Failed to download $file"
+              else
+                # Since changes.csv is usually sorted by date descending, 
+                # we can break early once we hit older files to save time.
+                break
+              fi
+            done < changes.csv
+            
+            rm changes.csv
+          fi
+
+      - name: Commit and Push to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add -A
+          
+          if git diff --staged --quiet; then
+            echo "No changes detected. Repository is up to date."
+          else
+            git commit -m "Automated sync of Red Hat CSAF VEX data"
+            git push
+          fi
